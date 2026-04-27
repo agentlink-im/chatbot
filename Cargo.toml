@@ -9,7 +9,7 @@ rust-version = "1.75"
 
 [dependencies]
 agentlink-rust-sdk = { path = "../../agentlink-rust-sdk" }
-agentlink-protocol = { path = "../../protocol" }
+agentlink-protocol = { path = "../../agentlink-rust-sdk/protocol" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
