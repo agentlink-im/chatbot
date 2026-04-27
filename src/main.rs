@@ -5,15 +5,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use agentlink_protocol::message::SendMessageRequest;
 use agentlink_protocol::MessageType;
-use agentlink_rust_sdk::event_handler::MESSAGE_CREATED;
+use agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED};
 use agentlink_rust_sdk::{AgentLinkClient, SdkConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // ===================================================================
-// DeepSeek API 类型
+// DeepSeek API Types
 // ===================================================================
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -43,7 +43,7 @@ struct DeepSeekChoice {
 }
 
 // ===================================================================
-// Conversation Memory（锁粒度细化到每个 conversation）
+// Conversation Memory (per-conversation locking)
 // ===================================================================
 
 #[derive(Clone, Debug)]
@@ -98,125 +98,8 @@ async fn get_or_create_memory(
 }
 
 // ===================================================================
-// Main
+// DeepSeek API Call
 // ===================================================================
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            env::var("RUST_LOG")
-                .unwrap_or_else(|_| "chatbot_agent=info,agentlink_rust_sdk=warn".into()),
-        )
-        .init();
-
-    let base_url = env::var("AGENTLINK_BASE_URL")
-        .unwrap_or_else(|_| "https://beta-api.agentlink.chat/".to_string());
-    let api_key = env::var("AGENTLINK_API_KEY")
-        .context("AGENTLINK_API_KEY environment variable is required")?;
-    let deepseek_api_key = env::var("DEEPSEEK_API_KEY")
-        .context("DEEPSEEK_API_KEY environment variable is required")?;
-
-    let max_history: usize = env::var("MAX_HISTORY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
-
-    info!(base_url = %base_url, max_history, "Starting chatbot agent with per-conversation memory");
-
-    let mut client = AgentLinkClient::new(
-        SdkConfig::new(&base_url).with_token(&api_key),
-    )
-    .context("Failed to create AgentLink client")?;
-
-    let me = client
-        .users
-        .get_current_user()
-        .await
-        .context("Failed to get current user")?;
-    let my_user_id = me.id;
-    info!(
-        user_id = %my_user_id,
-        linkid = %me.linkid,
-        display_name = %me.display_name.unwrap_or_default(),
-        "Agent authenticated"
-    );
-
-    let memory_store: MemoryStore = Arc::new(RwLock::new(HashMap::new()));
-
-    let reply_client = client.clone();
-    let ds_key = deepseek_api_key.clone();
-    let mem_store = memory_store.clone();
-
-    client.on(MESSAGE_CREATED, move |payload| {
-        let client = reply_client.clone();
-        let ds_key = ds_key.clone();
-        let mem_store = mem_store.clone();
-        let my_user_id = my_user_id;
-        let max_history = max_history;
-
-        async move {
-            let msg = payload.message;
-            let conversation_id = msg.conversation_id;
-
-            if msg.sender_id == my_user_id {
-                return;
-            }
-
-            info!(
-                conversation_id = %conversation_id,
-                sender_id = %msg.sender_id,
-                sender_name = %msg.sender_name,
-                content = %msg.content,
-                "Received message"
-            );
-
-            let mem = get_or_create_memory(&mem_store, conversation_id, max_history).await;
-            mem.lock().await.push("user", msg.content.clone());
-            drop(mem);
-
-            match call_deepseek(&ds_key, &mem_store, conversation_id).await {
-                Ok(reply) => {
-                    info!(reply = %reply, "DeepSeek replied");
-
-                    let mem = get_or_create_memory(&mem_store, conversation_id, max_history).await;
-                    mem.lock().await.push("assistant", reply.clone());
-                    drop(mem);
-
-                    let send_req = SendMessageRequest {
-                        content: reply,
-                        kind: Some(MessageType::Text),
-                        metadata: None,
-                        reply_to: Some(msg.id),
-                    };
-
-                    match client
-                        .messages
-                        .send_message(&conversation_id.to_string(), send_req)
-                        .await
-                    {
-                        Ok(sent) => {
-                            info!(message_id = %sent.id, "Reply sent successfully");
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to send reply");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "DeepSeek API call failed");
-                }
-            }
-        }
-    });
-
-    info!("WebSocket connected, entering event poll loop...");
-    client.poll().await.context("Event poll loop ended with error")?;
-
-    Ok(())
-}
 
 async fn call_deepseek(
     api_key: &str,
@@ -277,4 +160,230 @@ async fn call_deepseek(
         .unwrap_or_else(|| "Sorry, I couldn't generate a response.".to_string());
 
     Ok(reply)
+}
+
+// ===================================================================
+// Main
+// ===================================================================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            env::var("RUST_LOG")
+                .unwrap_or_else(|_| "chatbot_agent=info,agentlink_rust_sdk=warn".into()),
+        )
+        .init();
+
+    let base_url = env::var("AGENTLINK_BASE_URL")
+        .unwrap_or_else(|_| "https://beta-api.agentlink.chat/".to_string());
+    let api_key = env::var("AGENTLINK_API_KEY")
+        .context("AGENTLINK_API_KEY environment variable is required")?;
+    let deepseek_api_key = env::var("DEEPSEEK_API_KEY")
+        .context("DEEPSEEK_API_KEY environment variable is required")?;
+
+    let max_history: usize = env::var("MAX_HISTORY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+
+    info!(base_url = %base_url, max_history, "Starting chatbot agent");
+
+    let client = AgentLinkClient::new(
+        SdkConfig::new(&base_url).with_token(&api_key),
+    )
+    .context("Failed to create AgentLink client")?;
+
+    // Authenticate and identify ourselves
+    let me = client
+        .users
+        .get_current_user()
+        .await
+        .context("Failed to get current user")?;
+    let my_user_id = me.id;
+    info!(
+        user_id = %my_user_id,
+        linkid = %me.linkid,
+        display_name = %me.display_name.unwrap_or_default(),
+        "Agent authenticated"
+    );
+
+    // Set agent as available
+    match client
+        .agents
+        .update_agent_availability(&my_user_id.to_string(), true)
+        .await
+    {
+        Ok(_) => info!("Agent marked as available"),
+        Err(e) => warn!(error = %e, "Failed to set agent availability"),
+    }
+
+    let memory_store: MemoryStore = Arc::new(RwLock::new(HashMap::new()));
+
+    // Clone client for use inside callbacks (on() now takes &self, safe to clone after)
+    let reply_client = client.clone();
+    let ds_key = deepseek_api_key.clone();
+    let mem_store = memory_store.clone();
+
+    // Register message handler
+    client.on(MESSAGE_CREATED, move |payload| {
+        let client = reply_client.clone();
+        let ds_key = ds_key.clone();
+        let mem_store = mem_store.clone();
+        let my_user_id = my_user_id;
+        let max_history = max_history;
+
+        async move {
+            let msg = payload.message;
+            let conversation_id = msg.conversation_id;
+
+            // Ignore our own messages
+            if msg.sender_id == my_user_id {
+                return;
+            }
+
+            // Only respond to text messages
+            if msg.kind != MessageType::Text {
+                info!(
+                    conversation_id = %conversation_id,
+                    kind = ?msg.kind,
+                    "Ignoring non-text message"
+                );
+                return;
+            }
+
+            info!(
+                conversation_id = %conversation_id,
+                sender_id = %msg.sender_id,
+                sender_name = %msg.sender_name,
+                content = %msg.content,
+                "Received message"
+            );
+
+            // Store user message in memory
+            let mem = get_or_create_memory(&mem_store, conversation_id, max_history).await;
+            mem.lock().await.push("user", msg.content.clone());
+            drop(mem);
+
+            // Call DeepSeek and reply
+            match call_deepseek(&ds_key, &mem_store, conversation_id).await {
+                Ok(reply) => {
+                    info!(reply = %reply, "DeepSeek replied");
+
+                    // Store assistant reply in memory
+                    let mem = get_or_create_memory(&mem_store, conversation_id, max_history).await;
+                    mem.lock().await.push("assistant", reply.clone());
+                    drop(mem);
+
+                    let send_req = SendMessageRequest {
+                        content: reply,
+                        kind: Some(MessageType::Text),
+                        metadata: None,
+                        reply_to: Some(msg.id),
+                    };
+
+                    match client
+                        .messages
+                        .send_message(&conversation_id.to_string(), send_req)
+                        .await
+                    {
+                        Ok(sent) => {
+                            info!(message_id = %sent.id, "Reply sent successfully");
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to send reply");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "DeepSeek API call failed");
+
+                    // Inform the user that something went wrong
+                    let error_reply = SendMessageRequest {
+                        content: "Sorry, I'm having trouble responding right now. Please try again later.".to_string(),
+                        kind: Some(MessageType::Text),
+                        metadata: None,
+                        reply_to: Some(msg.id),
+                    };
+
+                    if let Err(send_err) = client
+                        .messages
+                        .send_message(&conversation_id.to_string(), error_reply)
+                        .await
+                    {
+                        error!(error = %send_err, "Failed to send error reply");
+                    }
+                }
+            }
+        }
+    });
+
+    // Register connection event handlers for observability
+    client.on(CONNECTION_READY, |payload| async move {
+        info!(
+            user_id = %payload.user_id,
+            linkid = %payload.linkid,
+            "WebSocket connected and ready"
+        );
+    });
+
+    client.on(ERROR, |payload| async move {
+        error!(
+            code = %payload.code,
+            message = %payload.message,
+            "WebSocket error received"
+        );
+    });
+
+    // Run WebSocket event loop in a background task
+    let mut poll_client = client.clone();
+    let poll_handle = tokio::spawn(async move {
+        info!("Entering WebSocket event poll loop...");
+        if let Err(e) = poll_client.poll().await {
+            error!(error = %e, "Event poll loop ended with error");
+        }
+    });
+
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down gracefully...");
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                let mut sigterm = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate()
+                ).expect("Failed to create SIGTERM handler");
+                sigterm.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("Received SIGTERM, shutting down gracefully...");
+        }
+        result = poll_handle => {
+            if let Err(e) = result {
+                error!(error = %e, "Poll task panicked");
+            }
+            info!("Poll loop ended, shutting down...");
+        }
+    }
+
+    // Mark agent as unavailable before exiting
+    match client
+        .agents
+        .update_agent_availability(&my_user_id.to_string(), false)
+        .await
+    {
+        Ok(_) => info!("Agent marked as unavailable"),
+        Err(e) => warn!(error = %e, "Failed to set agent unavailability"),
+    }
+
+    info!("Chatbot agent stopped");
+    Ok(())
 }
