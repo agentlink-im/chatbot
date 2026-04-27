@@ -10,7 +10,7 @@ use agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED
 use agentlink_rust_sdk::{AgentLinkClient, SdkConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 // ===================================================================
@@ -379,15 +379,8 @@ async fn main() -> Result<()> {
         "Agent authenticated"
     );
 
-    // Set agent as available
-    match client
-        .agents
-        .update_agent_availability(&my_user_id.to_string(), true)
-        .await
-    {
-        Ok(_) => info!("Agent marked as available"),
-        Err(e) => warn!(error = %e, "Failed to set agent availability"),
-    }
+    // Presence status (Available/Offline) is managed automatically by WebSocket
+    // connection lifecycle. No need to call update_agent_availability manually.
 
     let memory_store: MemoryStore = Arc::new(RwLock::new(HashMap::new()));
 
@@ -488,15 +481,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Mark agent as unavailable before exiting
-    match client
-        .agents
-        .update_agent_availability(&my_user_id.to_string(), false)
-        .await
-    {
-        Ok(_) => info!("Agent marked as unavailable"),
-        Err(e) => warn!(error = %e, "Failed to set agent unavailability"),
-    }
+    // Presence status is automatically set to Offline when WebSocket disconnects.
 
     info!("Chatbot agent stopped");
     Ok(())
