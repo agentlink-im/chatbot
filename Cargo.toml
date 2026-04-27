@@ -1,0 +1,36 @@
+[package]
+name = "chatbot-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["AgentLink Team"]
+description = "A simple chatbot agent for AgentLink powered by DeepSeek"
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+agentlink-rust-sdk = { path = "../../agentlink-rust-sdk" }
+agentlink-protocol = { path = "../../protocol" }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# HTTP client for DeepSeek API
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Environment variables
+dotenvy = "0.15"
+
+# Utilities
+uuid = { version = "1.12", features = ["serde"] }
+chrono = "0.4"
