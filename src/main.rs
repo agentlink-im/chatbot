@@ -3,6 +3,7 @@ use std::env;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use agentlink_protocol::file::FileAttachment;
 use agentlink_protocol::message::SendMessageRequest;
 use agentlink_protocol::MessageType;
 use agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED};
@@ -163,6 +164,174 @@ async fn call_deepseek(
 }
 
 // ===================================================================
+// Message Handlers
+// ===================================================================
+
+async fn handle_text_message(
+    client: &AgentLinkClient,
+    ds_key: &str,
+    mem_store: &MemoryStore,
+    conversation_id: Uuid,
+    max_history: usize,
+    msg: agentlink_protocol::message::MessageResponse,
+) {
+    info!(
+        conversation_id = %conversation_id,
+        sender_id = %msg.sender_id,
+        sender_name = %msg.sender_name,
+        content = %msg.content,
+        "Received text message"
+    );
+
+    // Store user message in memory
+    let mem = get_or_create_memory(mem_store, conversation_id, max_history).await;
+    mem.lock().await.push("user", msg.content.clone());
+    drop(mem);
+
+    // Call DeepSeek and reply
+    match call_deepseek(ds_key, mem_store, conversation_id).await {
+        Ok(reply) => {
+            info!(reply = %reply, "DeepSeek replied");
+
+            // Store assistant reply in memory
+            let mem = get_or_create_memory(mem_store, conversation_id, max_history).await;
+            mem.lock().await.push("assistant", reply.clone());
+            drop(mem);
+
+            let send_req = SendMessageRequest {
+                content: reply,
+                kind: Some(MessageType::Text),
+                metadata: None,
+                reply_to: Some(msg.id),
+            };
+
+            match client
+                .messages
+                .send_message(&conversation_id.to_string(), send_req)
+                .await
+            {
+                Ok(sent) => {
+                    info!(message_id = %sent.id, "Reply sent successfully");
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to send reply");
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "DeepSeek API call failed");
+
+            // Inform the user that something went wrong
+            let error_reply = SendMessageRequest {
+                content: "Sorry, I'm having trouble responding right now. Please try again later.".to_string(),
+                kind: Some(MessageType::Text),
+                metadata: None,
+                reply_to: Some(msg.id),
+            };
+
+            if let Err(send_err) = client
+                .messages
+                .send_message(&conversation_id.to_string(), error_reply)
+                .await
+            {
+                error!(error = %send_err, "Failed to send error reply");
+            }
+        }
+    }
+}
+
+async fn handle_file_message(
+    client: &AgentLinkClient,
+    conversation_id: Uuid,
+    msg: agentlink_protocol::message::MessageResponse,
+) {
+    info!(
+        conversation_id = %conversation_id,
+        sender_id = %msg.sender_id,
+        sender_name = %msg.sender_name,
+        "Received file message"
+    );
+
+    // Parse file attachment from metadata
+    let attachment: Option<FileAttachment> = msg
+        .metadata
+        .as_ref()
+        .and_then(|m| serde_json::from_value(m.clone()).ok());
+
+    let file_desc = match &attachment {
+        Some(att) => format!("file '{}' ({} bytes)", att.filename, att.size),
+        None => "a file".to_string(),
+    };
+
+    info!(file_desc = %file_desc, "File details parsed");
+
+    // Acknowledge receipt of the file
+    let ack = format!(
+        "I've received {}. If you'd like me to analyze it or have questions about it, just let me know!",
+        file_desc
+    );
+
+    let send_req = SendMessageRequest {
+        content: ack,
+        kind: Some(MessageType::Text),
+        metadata: None,
+        reply_to: Some(msg.id),
+    };
+
+    if let Err(e) = client
+        .messages
+        .send_message(&conversation_id.to_string(), send_req)
+        .await
+    {
+        error!(error = %e, "Failed to send file acknowledgment");
+    }
+}
+
+async fn handle_image_message(
+    client: &AgentLinkClient,
+    conversation_id: Uuid,
+    msg: agentlink_protocol::message::MessageResponse,
+) {
+    info!(
+        conversation_id = %conversation_id,
+        sender_id = %msg.sender_id,
+        sender_name = %msg.sender_name,
+        "Received image message"
+    );
+
+    // Parse image attachment from metadata
+    let attachment: Option<FileAttachment> = msg
+        .metadata
+        .as_ref()
+        .and_then(|m| serde_json::from_value(m.clone()).ok());
+
+    let image_desc = match &attachment {
+        Some(att) => format!("image '{}' ({} bytes)", att.filename, att.size),
+        None => "an image".to_string(),
+    };
+
+    let ack = format!(
+        "I've received {}. I can see images, but detailed image analysis is not yet supported. Feel free to describe what you'd like me to focus on!",
+        image_desc
+    );
+
+    let send_req = SendMessageRequest {
+        content: ack,
+        kind: Some(MessageType::Text),
+        metadata: None,
+        reply_to: Some(msg.id),
+    };
+
+    if let Err(e) = client
+        .messages
+        .send_message(&conversation_id.to_string(), send_req)
+        .await
+    {
+        error!(error = %e, "Failed to send image acknowledgment");
+    }
+}
+
+// ===================================================================
 // Main
 // ===================================================================
 
@@ -244,77 +413,22 @@ async fn main() -> Result<()> {
                 return;
             }
 
-            // Only respond to text messages
-            if msg.kind != MessageType::Text {
-                info!(
-                    conversation_id = %conversation_id,
-                    kind = ?msg.kind,
-                    "Ignoring non-text message"
-                );
-                return;
-            }
-
-            info!(
-                conversation_id = %conversation_id,
-                sender_id = %msg.sender_id,
-                sender_name = %msg.sender_name,
-                content = %msg.content,
-                "Received message"
-            );
-
-            // Store user message in memory
-            let mem = get_or_create_memory(&mem_store, conversation_id, max_history).await;
-            mem.lock().await.push("user", msg.content.clone());
-            drop(mem);
-
-            // Call DeepSeek and reply
-            match call_deepseek(&ds_key, &mem_store, conversation_id).await {
-                Ok(reply) => {
-                    info!(reply = %reply, "DeepSeek replied");
-
-                    // Store assistant reply in memory
-                    let mem = get_or_create_memory(&mem_store, conversation_id, max_history).await;
-                    mem.lock().await.push("assistant", reply.clone());
-                    drop(mem);
-
-                    let send_req = SendMessageRequest {
-                        content: reply,
-                        kind: Some(MessageType::Text),
-                        metadata: None,
-                        reply_to: Some(msg.id),
-                    };
-
-                    match client
-                        .messages
-                        .send_message(&conversation_id.to_string(), send_req)
-                        .await
-                    {
-                        Ok(sent) => {
-                            info!(message_id = %sent.id, "Reply sent successfully");
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to send reply");
-                        }
-                    }
+            match msg.kind {
+                MessageType::Text => {
+                    handle_text_message(&client, &ds_key, &mem_store, conversation_id, max_history, msg).await;
                 }
-                Err(e) => {
-                    error!(error = %e, "DeepSeek API call failed");
-
-                    // Inform the user that something went wrong
-                    let error_reply = SendMessageRequest {
-                        content: "Sorry, I'm having trouble responding right now. Please try again later.".to_string(),
-                        kind: Some(MessageType::Text),
-                        metadata: None,
-                        reply_to: Some(msg.id),
-                    };
-
-                    if let Err(send_err) = client
-                        .messages
-                        .send_message(&conversation_id.to_string(), error_reply)
-                        .await
-                    {
-                        error!(error = %send_err, "Failed to send error reply");
-                    }
+                MessageType::File => {
+                    handle_file_message(&client, conversation_id, msg).await;
+                }
+                MessageType::Image => {
+                    handle_image_message(&client, conversation_id, msg).await;
+                }
+                _ => {
+                    info!(
+                        conversation_id = %conversation_id,
+                        kind = ?msg.kind,
+                        "Ignoring unsupported message type"
+                    );
                 }
             }
         }
