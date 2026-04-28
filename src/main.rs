@@ -379,9 +379,6 @@ async fn main() -> Result<()> {
         "Agent authenticated"
     );
 
-    // Presence status (Available/Offline) is managed automatically by WebSocket
-    // connection lifecycle. No need to call update_agent_availability manually.
-
     let memory_store: MemoryStore = Arc::new(RwLock::new(HashMap::new()));
 
     // Clone client for use inside callbacks (on() now takes &self, safe to clone after)
@@ -444,6 +441,13 @@ async fn main() -> Result<()> {
         );
     });
 
+    // Set agent availability to online before starting WebSocket loop
+    if let Err(e) = client.agents.update_agent_availability(&my_user_id.to_string(), true).await {
+        error!(error = %e, "Failed to set agent availability to online");
+    } else {
+        info!("Agent availability set to online");
+    }
+
     // Run WebSocket event loop in a background task
     let mut poll_client = client.clone();
     let poll_handle = tokio::spawn(async move {
@@ -481,7 +485,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Presence status is automatically set to Offline when WebSocket disconnects.
+    // Set agent availability to offline on shutdown
+    if let Err(e) = client.agents.update_agent_availability(&my_user_id.to_string(), false).await {
+        error!(error = %e, "Failed to set agent availability to offline");
+    } else {
+        info!("Agent availability set to offline");
+    }
 
     info!("Chatbot agent stopped");
     Ok(())
