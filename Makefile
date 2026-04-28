@@ -85,8 +85,13 @@ check: ## Run all pre-flight checks before starting the agent
 		echo ""; \
 		echo "$(RED)$(BOLD)Pre-flight check failed.$(RESET)"; \
 		echo "  → agentlink-rust-sdk not found at $(SDK_PATH)."; \
-		echo "  → Ensure the SDK repository is cloned alongside this project:"; \
-		echo "      $(SDK_PATH)/"; \
+		if [ -f "../../.gitmodules" ] && grep -q "agentlink-rust-sdk" ../../.gitmodules 2>/dev/null; then \
+			echo "  → This project uses a git submodule. Run the following from the repository root:"; \
+			echo "      git submodule update --init agentlink-rust-sdk"; \
+		else \
+			echo "  → Ensure the SDK repository is cloned alongside this project:"; \
+			echo "      $(SDK_PATH)/"; \
+		fi; \
 		echo ""; \
 		exit 1; \
 	fi
