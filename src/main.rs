@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
         skill = %config.skill_name,
         max_turns = config.max_turns,
         max_history = config.max_history,
+        status_reporting_enabled = config.status_reporting_enabled,
         "Starting chatbot agent"
     );
 
