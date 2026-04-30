@@ -1,7 +1,0 @@
-[net]
-git-fetch-with-cli = true
-
-# Patch git dependencies to use local SDK paths for monorepo development
-[patch."ssh://git@github.com/agentlink-im/agentlink-rust-sdk.git"]
-agentlink-rust-sdk = { path = "../../agentlink-rust-sdk" }
-agentlink-protocol = { path = "../../agentlink-rust-sdk/protocol" }
