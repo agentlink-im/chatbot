@@ -4,7 +4,7 @@ use anyhow::Result;
 use rigent::agentlink_protocol::file::FileAttachment;
 use rigent::agentlink_protocol::MessageType;
 use rigent::agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED};
-use rigent::{config::FrameworkConfig, framework::AgentFramework};
+use rigent::{config::FrameworkConfig, framework::AgentFramework, status::StatusReporter};
 use tracing::{error, info};
 
 // ===================================================================
@@ -25,32 +25,49 @@ async fn handle_text_message(
         "Received text message"
     );
 
-    // Use Rigent's native conversation memory via framework.chat()
-    match framework.chat(&conversation_id, &msg.content).await {
-        Ok(reply) => {
-            info!(reply = %reply, "Agent replied");
+    // Status reporting: wrap the entire handling flow so that tool
+    // invocations (running inside the same async task) can access the
+    // reporter via task-local storage.
+    let reporter = StatusReporter::new(framework.sdk_client.clone(), conversation_id.clone());
 
-            if let Err(e) = framework
-                .send_reply(&conversation_id, reply, Some(msg.id))
+    reporter
+        .scope(|| async {
+            reporter.thinking("正在分析您的需求...").await;
+
+            // Use Rigent's native conversation memory via framework.chat_with_status()
+            match framework
+                .chat_with_status(&conversation_id, &msg.content, &reporter)
                 .await
             {
-                error!(error = %e, "Failed to send reply");
-            }
-        }
-        Err(e) => {
-            error!(error = %e, "Agent chat failed");
+                Ok(reply) => {
+                    info!(reply = %reply, "Agent replied");
+                    reporter.complete("处理完成", "回答已生成").await;
 
-            let error_reply =
-                "Sorry, I'm having trouble responding right now. Please try again later."
-                    .to_string();
-            if let Err(send_err) = framework
-                .send_reply(&conversation_id, error_reply, Some(msg.id))
-                .await
-            {
-                error!(error = %send_err, "Failed to send error reply");
+                    if let Err(e) = framework
+                        .send_reply(&conversation_id, reply, Some(msg.id))
+                        .await
+                    {
+                        error!(error = %e, "Failed to send reply");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Agent chat failed");
+                    reporter
+                        .error_retry(&format!("处理过程中出错: {}", e))
+                        .await;
+
+                    let error_reply = "Sorry, I'm having trouble responding right now. Please try again later."
+                        .to_string();
+                    if let Err(send_err) = framework
+                        .send_reply(&conversation_id, error_reply, Some(msg.id))
+                        .await
+                    {
+                        error!(error = %send_err, "Failed to send error reply");
+                    }
+                }
             }
-        }
-    }
+        })
+        .await;
 }
 
 async fn handle_file_message(
