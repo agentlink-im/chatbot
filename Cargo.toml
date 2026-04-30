@@ -9,7 +9,7 @@ rust-version = "1.75"
 
 [dependencies]
 # Rigent framework — provides SDK, protocol, LLM agent, skill, and tool infrastructure
-rigent = { git = "ssh://git@github.com/agentlink-im/rigent.git", branch = "main" }
+rigent = { workspace = true }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
