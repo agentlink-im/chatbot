@@ -107,7 +107,7 @@ check: ## Run all pre-flight checks before starting the agent
 		echo "  → .env file is missing."; \
 		echo "  → Copy the example and configure your API keys:"; \
 		echo "      cp .env.example .env"; \
-		echo "  → Then edit .env and set your AGENTLINK_API_KEY and DEEPSEEK_API_KEY."; \
+		echo "  → Then edit .env and set your AGENTLINK_API_KEY and the API key for your LLM_PROVIDER."; \
 		echo ""; \
 		exit 1; \
 	fi
@@ -136,24 +136,24 @@ check: ## Run all pre-flight checks before starting the agent
 		echo "$(GREEN)✓ OK$(RESET)"; \
 	fi
 
-	@# --- Check 6: DEEPSEEK_API_KEY configured ---
-	@echo -n "  [6/6] Checking DEEPSEEK_API_KEY ... "
-	@DEEPSEEK_KEY=$$(grep -E '^DEEPSEEK_API_KEY=' .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "'); \
-	if [ -z "$$DEEPSEEK_KEY" ]; then \
+	@# --- Check 6: LLM_API_KEY configured ---
+	@echo -n "  [6/6] Checking LLM_API_KEY ... "
+	@LLM_KEY=$$(grep -E '^LLM_API_KEY=' .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "'); \
+	if [ -z "$$LLM_KEY" ]; then \
 		echo "$(RED)✗ FAILED$(RESET)"; \
 		echo ""; \
 		echo "$(RED)$(BOLD)Pre-flight check failed.$(RESET)"; \
-		echo "  → DEEPSEEK_API_KEY is not set in .env."; \
-		echo "  → Get your API key from https://platform.deepseek.com/ and add it to .env:"; \
-		echo "      DEEPSEEK_API_KEY=sk-your-actual-deepseek-key"; \
+		echo "  → LLM_API_KEY is not set in .env."; \
+		echo "  → Add it to .env:"; \
+		echo "      LLM_API_KEY=sk-your-actual-key"; \
 		echo ""; \
 		exit 1; \
-	elif echo "$$DEEPSEEK_KEY" | grep -qiE 'your.*key|placeholder|example|xxxx'; then \
+	elif echo "$$LLM_KEY" | grep -qiE 'your.*key|placeholder|example|xxxx'; then \
 		echo "$(RED)✗ FAILED$(RESET)"; \
 		echo ""; \
 		echo "$(RED)$(BOLD)Pre-flight check failed.$(RESET)"; \
-		echo "  → DEEPSEEK_API_KEY appears to be a placeholder value: $$DEEPSEEK_KEY"; \
-		echo "  → Replace it with your actual DeepSeek API key."; \
+		echo "  → LLM_API_KEY appears to be a placeholder value: $$LLM_KEY"; \
+		echo "  → Replace it with your actual API key."; \
 		echo ""; \
 		exit 1; \
 	else \

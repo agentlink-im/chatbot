@@ -3,19 +3,16 @@ name = "chatbot-agent"
 version = "0.1.0"
 edition = "2021"
 authors = ["AgentLink Team"]
-description = "A simple chatbot agent for AgentLink powered by DeepSeek"
+description = "A chatbot agent for AgentLink powered by the Rigent framework"
 license = "MIT"
 rust-version = "1.75"
 
 [dependencies]
-agentlink-rust-sdk = { path = "../../agentlink-rust-sdk" }
-agentlink-protocol = { path = "../../agentlink-rust-sdk/protocol" }
+# Rigent framework — provides SDK, protocol, LLM agent, skill, and tool infrastructure
+rigent = { path = "../rigent" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
-
-# HTTP client for DeepSeek API
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -31,6 +28,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Environment variables
 dotenvy = "0.15"
 
+# TLS (explicitly select ring crypto provider to avoid rustls auto-detection panic)
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Utilities
 uuid = { version = "1.12", features = ["serde"] }
-chrono = "0.4"

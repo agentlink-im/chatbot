@@ -1,180 +1,22 @@
-use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use agentlink_protocol::file::FileAttachment;
-use agentlink_protocol::message::SendMessageRequest;
-use agentlink_protocol::MessageType;
-use agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED};
-use agentlink_rust_sdk::{AgentLinkClient, SdkConfig};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use anyhow::Result;
+use rigent::agentlink_protocol::file::FileAttachment;
+use rigent::agentlink_protocol::MessageType;
+use rigent::agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED};
+use rigent::{config::FrameworkConfig, framework::AgentFramework};
 use tracing::{error, info};
-use uuid::Uuid;
-
-// ===================================================================
-// DeepSeek API Types
-// ===================================================================
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct DeepSeekMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Serialize, Debug)]
-struct DeepSeekRequest {
-    model: String,
-    messages: Vec<DeepSeekMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-}
-
-#[derive(Deserialize, Debug)]
-struct DeepSeekResponse {
-    choices: Vec<DeepSeekChoice>,
-}
-
-#[derive(Deserialize, Debug)]
-struct DeepSeekChoice {
-    message: DeepSeekMessage,
-}
-
-// ===================================================================
-// Conversation Memory (per-conversation locking)
-// ===================================================================
-
-#[derive(Clone, Debug)]
-struct ChatMemory {
-    history: Vec<DeepSeekMessage>,
-    max_messages: usize,
-}
-
-impl ChatMemory {
-    fn new(max_messages: usize) -> Self {
-        Self {
-            history: Vec::with_capacity(max_messages),
-            max_messages,
-        }
-    }
-
-    fn push(&mut self, role: &str, content: String) {
-        self.history.push(DeepSeekMessage {
-            role: role.to_string(),
-            content,
-        });
-        if self.history.len() > self.max_messages {
-            let excess = self.history.len() - self.max_messages;
-            self.history.drain(0..excess);
-        }
-    }
-
-    fn to_vec(&self) -> Vec<DeepSeekMessage> {
-        self.history.clone()
-    }
-}
-
-type MemoryStore = Arc<RwLock<HashMap<Uuid, Arc<Mutex<ChatMemory>>>>>;
-
-async fn get_or_create_memory(
-    store: &MemoryStore,
-    conversation_id: Uuid,
-    max_messages: usize,
-) -> Arc<Mutex<ChatMemory>> {
-    {
-        let read_guard = store.read().await;
-        if let Some(mem) = read_guard.get(&conversation_id) {
-            return mem.clone();
-        }
-    }
-
-    let mut write_guard = store.write().await;
-    write_guard
-        .entry(conversation_id)
-        .or_insert_with(|| Arc::new(Mutex::new(ChatMemory::new(max_messages))))
-        .clone()
-}
-
-// ===================================================================
-// DeepSeek API Call
-// ===================================================================
-
-async fn call_deepseek(
-    api_key: &str,
-    memory_store: &MemoryStore,
-    conversation_id: Uuid,
-) -> Result<String> {
-    let history = {
-        let read_guard = memory_store.read().await;
-        if let Some(mem) = read_guard.get(&conversation_id) {
-            mem.lock().await.to_vec()
-        } else {
-            Vec::new()
-        }
-    };
-
-    let mut messages = vec![DeepSeekMessage {
-        role: "system".to_string(),
-        content: "You are a helpful assistant on the AgentLink platform. Keep replies concise and friendly.".to_string(),
-    }];
-    messages.extend(history);
-
-    let request_body = DeepSeekRequest {
-        model: "deepseek-chat".to_string(),
-        messages,
-        max_tokens: Some(1024),
-        temperature: Some(0.7),
-    };
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.deepseek.com/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .context("Failed to send request to DeepSeek")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unknown>".to_string());
-        anyhow::bail!("DeepSeek API returned {}: {}", status, text);
-    }
-
-    let deepseek_resp: DeepSeekResponse = response
-        .json()
-        .await
-        .context("Failed to parse DeepSeek response")?;
-
-    let reply = deepseek_resp
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .unwrap_or_else(|| "Sorry, I couldn't generate a response.".to_string());
-
-    Ok(reply)
-}
 
 // ===================================================================
 // Message Handlers
 // ===================================================================
 
 async fn handle_text_message(
-    client: &AgentLinkClient,
-    ds_key: &str,
-    mem_store: &MemoryStore,
-    conversation_id: Uuid,
-    max_history: usize,
-    msg: agentlink_protocol::message::MessageResponse,
+    framework: &AgentFramework,
+    msg: rigent::agentlink_protocol::message::MessageResponse,
 ) {
+    let conversation_id = msg.conversation_id.to_string();
+
     info!(
         conversation_id = %conversation_id,
         sender_id = %msg.sender_id,
@@ -183,55 +25,26 @@ async fn handle_text_message(
         "Received text message"
     );
 
-    // Store user message in memory
-    let mem = get_or_create_memory(mem_store, conversation_id, max_history).await;
-    mem.lock().await.push("user", msg.content.clone());
-    drop(mem);
-
-    // Call DeepSeek and reply
-    match call_deepseek(ds_key, mem_store, conversation_id).await {
+    // Use Rigent's native conversation memory via framework.chat()
+    match framework.chat(&conversation_id, &msg.content).await {
         Ok(reply) => {
-            info!(reply = %reply, "DeepSeek replied");
+            info!(reply = %reply, "Agent replied");
 
-            // Store assistant reply in memory
-            let mem = get_or_create_memory(mem_store, conversation_id, max_history).await;
-            mem.lock().await.push("assistant", reply.clone());
-            drop(mem);
-
-            let send_req = SendMessageRequest {
-                content: reply,
-                kind: Some(MessageType::Text),
-                metadata: None,
-                reply_to: Some(msg.id),
-            };
-
-            match client
-                .messages
-                .send_message(&conversation_id.to_string(), send_req)
+            if let Err(e) = framework
+                .send_reply(&conversation_id, reply, Some(msg.id))
                 .await
             {
-                Ok(sent) => {
-                    info!(message_id = %sent.id, "Reply sent successfully");
-                }
-                Err(e) => {
-                    error!(error = %e, "Failed to send reply");
-                }
+                error!(error = %e, "Failed to send reply");
             }
         }
         Err(e) => {
-            error!(error = %e, "DeepSeek API call failed");
+            error!(error = %e, "Agent chat failed");
 
-            // Inform the user that something went wrong
-            let error_reply = SendMessageRequest {
-                content: "Sorry, I'm having trouble responding right now. Please try again later.".to_string(),
-                kind: Some(MessageType::Text),
-                metadata: None,
-                reply_to: Some(msg.id),
-            };
-
-            if let Err(send_err) = client
-                .messages
-                .send_message(&conversation_id.to_string(), error_reply)
+            let error_reply =
+                "Sorry, I'm having trouble responding right now. Please try again later."
+                    .to_string();
+            if let Err(send_err) = framework
+                .send_reply(&conversation_id, error_reply, Some(msg.id))
                 .await
             {
                 error!(error = %send_err, "Failed to send error reply");
@@ -241,10 +54,11 @@ async fn handle_text_message(
 }
 
 async fn handle_file_message(
-    client: &AgentLinkClient,
-    conversation_id: Uuid,
-    msg: agentlink_protocol::message::MessageResponse,
+    framework: &AgentFramework,
+    msg: rigent::agentlink_protocol::message::MessageResponse,
 ) {
+    let conversation_id = msg.conversation_id.to_string();
+
     info!(
         conversation_id = %conversation_id,
         sender_id = %msg.sender_id,
@@ -265,22 +79,13 @@ async fn handle_file_message(
 
     info!(file_desc = %file_desc, "File details parsed");
 
-    // Acknowledge receipt of the file
     let ack = format!(
         "I've received {}. If you'd like me to analyze it or have questions about it, just let me know!",
         file_desc
     );
 
-    let send_req = SendMessageRequest {
-        content: ack,
-        kind: Some(MessageType::Text),
-        metadata: None,
-        reply_to: Some(msg.id),
-    };
-
-    if let Err(e) = client
-        .messages
-        .send_message(&conversation_id.to_string(), send_req)
+    if let Err(e) = framework
+        .send_reply(&conversation_id, ack, Some(msg.id))
         .await
     {
         error!(error = %e, "Failed to send file acknowledgment");
@@ -288,10 +93,11 @@ async fn handle_file_message(
 }
 
 async fn handle_image_message(
-    client: &AgentLinkClient,
-    conversation_id: Uuid,
-    msg: agentlink_protocol::message::MessageResponse,
+    framework: &AgentFramework,
+    msg: rigent::agentlink_protocol::message::MessageResponse,
 ) {
+    let conversation_id = msg.conversation_id.to_string();
+
     info!(
         conversation_id = %conversation_id,
         sender_id = %msg.sender_id,
@@ -315,16 +121,8 @@ async fn handle_image_message(
         image_desc
     );
 
-    let send_req = SendMessageRequest {
-        content: ack,
-        kind: Some(MessageType::Text),
-        metadata: None,
-        reply_to: Some(msg.id),
-    };
-
-    if let Err(e) = client
-        .messages
-        .send_message(&conversation_id.to_string(), send_req)
+    if let Err(e) = framework
+        .send_reply(&conversation_id, ack, Some(msg.id))
         .await
     {
         error!(error = %e, "Failed to send image acknowledgment");
@@ -337,85 +135,71 @@ async fn handle_image_message(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Explicitly install the ring crypto provider for rustls.
+    // Without this, rustls panics when both aws-lc-rs and ring features
+    // are present in the dependency tree because it cannot auto-select.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
         .with_env_filter(
             env::var("RUST_LOG")
-                .unwrap_or_else(|_| "chatbot_agent=info,agentlink_rust_sdk=warn".into()),
+                .unwrap_or_else(|_| "chatbot_agent=info,agentlink_rust_sdk=warn,rig_core=warn".into()),
         )
         .init();
 
-    let base_url = env::var("AGENTLINK_BASE_URL")
-        .unwrap_or_else(|_| "https://beta-api.agentlink.chat/".to_string());
-    let api_key = env::var("AGENTLINK_API_KEY")
-        .context("AGENTLINK_API_KEY environment variable is required")?;
-    let deepseek_api_key = env::var("DEEPSEEK_API_KEY")
-        .context("DEEPSEEK_API_KEY environment variable is required")?;
+    // Load Rigent framework configuration
+    let mut config = FrameworkConfig::from_env()?;
 
-    let max_history: usize = env::var("MAX_HISTORY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    // Default skill to chatbot if not explicitly set
+    if env::var("SKILL_NAME").is_err() {
+        config.skill_name = "chatbot".to_string();
+    }
 
-    info!(base_url = %base_url, max_history, "Starting chatbot agent");
+    // Default max_history to 20 if not explicitly set
+    if env::var("MAX_HISTORY").is_err() {
+        config.max_history = 20;
+    }
 
-    let client = AgentLinkClient::new(
-        SdkConfig::new(&base_url).with_token(&api_key),
-    )
-    .context("Failed to create AgentLink client")?;
-
-    // Authenticate and identify ourselves
-    let me = client
-        .users
-        .get_current_user()
-        .await
-        .context("Failed to get current user")?;
-    let my_user_id = me.id;
     info!(
-        user_id = %my_user_id,
-        linkid = %me.linkid,
-        display_name = %me.display_name.unwrap_or_default(),
-        "Agent authenticated"
+        provider = %config.llm_provider,
+        model = %config.llm_model,
+        skill = %config.skill_name,
+        max_turns = config.max_turns,
+        max_history = config.max_history,
+        "Starting chatbot agent"
     );
 
-    let memory_store: MemoryStore = Arc::new(RwLock::new(HashMap::new()));
-
-    // Clone client for use inside callbacks (on() now takes &self, safe to clone after)
-    let reply_client = client.clone();
-    let ds_key = deepseek_api_key.clone();
-    let mem_store = memory_store.clone();
+    // Initialize Rigent framework (connects to AgentLink, loads skill, builds LLM agent, sets up memory)
+    let framework = AgentFramework::new(&config).await?;
 
     // Register message handler
-    client.on(MESSAGE_CREATED, move |payload| {
-        let client = reply_client.clone();
-        let ds_key = ds_key.clone();
-        let mem_store = mem_store.clone();
-        let my_user_id = my_user_id;
-        let max_history = max_history;
+    let msg_framework = framework.clone();
+    framework.sdk_client.on(MESSAGE_CREATED, move |payload| {
+        let fw = msg_framework.clone();
 
         async move {
             let msg = payload.message;
-            let conversation_id = msg.conversation_id;
 
             // Ignore our own messages
-            if msg.sender_id == my_user_id {
+            if msg.sender_id == fw.my_user_id {
                 return;
             }
 
             match msg.kind {
                 MessageType::Text => {
-                    handle_text_message(&client, &ds_key, &mem_store, conversation_id, max_history, msg).await;
+                    handle_text_message(&fw, msg).await;
                 }
                 MessageType::File => {
-                    handle_file_message(&client, conversation_id, msg).await;
+                    handle_file_message(&fw, msg).await;
                 }
                 MessageType::Image => {
-                    handle_image_message(&client, conversation_id, msg).await;
+                    handle_image_message(&fw, msg).await;
                 }
                 _ => {
                     info!(
-                        conversation_id = %conversation_id,
+                        conversation_id = %msg.conversation_id,
                         kind = ?msg.kind,
                         "Ignoring unsupported message type"
                     );
@@ -424,8 +208,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Register connection event handlers for observability
-    client.on(CONNECTION_READY, |payload| async move {
+    // Register connection event handlers
+    framework.sdk_client.on(CONNECTION_READY, |payload| async move {
         info!(
             user_id = %payload.user_id,
             linkid = %payload.linkid,
@@ -433,7 +217,7 @@ async fn main() -> Result<()> {
         );
     });
 
-    client.on(ERROR, |payload| async move {
+    framework.sdk_client.on(ERROR, |payload| async move {
         error!(
             code = %payload.code,
             message = %payload.message,
@@ -441,15 +225,15 @@ async fn main() -> Result<()> {
         );
     });
 
-    // Set agent availability to online before starting WebSocket loop
-    if let Err(e) = client.agents.update_agent_availability(&my_user_id.to_string(), true).await {
+    // Set agent availability to online
+    if let Err(e) = framework.set_availability(true).await {
         error!(error = %e, "Failed to set agent availability to online");
     } else {
         info!("Agent availability set to online");
     }
 
     // Run WebSocket event loop in a background task
-    let mut poll_client = client.clone();
+    let mut poll_client = framework.sdk_client.clone();
     let poll_handle = tokio::spawn(async move {
         info!("Entering WebSocket event poll loop...");
         if let Err(e) = poll_client.poll().await {
@@ -486,7 +270,7 @@ async fn main() -> Result<()> {
     }
 
     // Set agent availability to offline on shutdown
-    if let Err(e) = client.agents.update_agent_availability(&my_user_id.to_string(), false).await {
+    if let Err(e) = framework.set_availability(false).await {
         error!(error = %e, "Failed to set agent availability to offline");
     } else {
         info!("Agent availability set to offline");
