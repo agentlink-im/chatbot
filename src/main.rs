@@ -5,7 +5,7 @@ use rigent::agentlink_protocol::file::FileAttachment;
 use rigent::agentlink_protocol::MessageType;
 use rigent::agentlink_rust_sdk::event_handler::{CONNECTION_READY, ERROR, MESSAGE_CREATED};
 use rigent::{config::FrameworkConfig, framework::AgentFramework, status::StatusReporter};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ===================================================================
 // Message Handlers
@@ -192,6 +192,9 @@ async fn main() -> Result<()> {
     // Initialize Rigent framework (connects to AgentLink, loads skill, builds LLM agent, sets up memory)
     let framework = AgentFramework::new(&config).await?;
 
+    // Channel to signal WebSocket connection readiness
+    let (ws_connected_tx, mut ws_connected_rx) = tokio::sync::watch::channel(false);
+
     // Register message handler
     let msg_framework = framework.clone();
     framework.sdk_client.on(MESSAGE_CREATED, move |payload| {
@@ -227,12 +230,17 @@ async fn main() -> Result<()> {
     });
 
     // Register connection event handlers
-    framework.sdk_client.on(CONNECTION_READY, |payload| async move {
-        info!(
-            user_id = %payload.user_id,
-            linkid = %payload.linkid,
-            "WebSocket connected and ready"
-        );
+    let connected_tx = ws_connected_tx.clone();
+    framework.sdk_client.on(CONNECTION_READY, move |payload| {
+        let tx = connected_tx.clone();
+        async move {
+            info!(
+                user_id = %payload.user_id,
+                linkid = %payload.linkid,
+                "WebSocket connected and ready"
+            );
+            let _ = tx.send(true);
+        }
     });
 
     framework.sdk_client.on(ERROR, |payload| async move {
@@ -243,13 +251,6 @@ async fn main() -> Result<()> {
         );
     });
 
-    // Set agent availability to online
-    if let Err(e) = framework.set_availability(true).await {
-        error!(error = %e, "Failed to set agent availability to online");
-    } else {
-        info!("Agent availability set to online");
-    }
-
     // Run WebSocket event loop in a background task
     let mut poll_client = framework.sdk_client.clone();
     let poll_handle = tokio::spawn(async move {
@@ -258,6 +259,34 @@ async fn main() -> Result<()> {
             error!(error = %e, "Event poll loop ended with error");
         }
     });
+
+    // Wait for WebSocket connection ready before setting availability
+    info!("Waiting for WebSocket connection ready...");
+    let connected = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        ws_connected_rx.changed(),
+    )
+    .await;
+
+    match connected {
+        Ok(Ok(())) if *ws_connected_rx.borrow() => {
+            info!("WebSocket connection confirmed, setting agent availability...");
+            if let Err(e) = framework.set_availability(true).await {
+                error!(error = %e, "Failed to set agent availability to online");
+            } else {
+                info!("Agent availability set to online");
+            }
+        }
+        Ok(Ok(())) => {
+            warn!("WebSocket connection signal received but state is false");
+        }
+        Ok(Err(_)) => {
+            warn!("WebSocket connection watch channel closed unexpectedly");
+        }
+        Err(_) => {
+            warn!("Timeout waiting for WebSocket connection ready after 30s, proceeding anyway");
+        }
+    }
 
     // Wait for shutdown signal
     tokio::select! {
