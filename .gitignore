@@ -5,3 +5,4 @@ Cargo.lock
 # Environment
 .env
 .env.local
+sugarcane.html
